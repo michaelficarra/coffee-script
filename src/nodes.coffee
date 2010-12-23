@@ -564,7 +564,7 @@ exports.Access = class Access extends Base
 
   compile: (o) ->
     name = @name.compile o
-    @proto + if IS_STRING.test name then "[#{name}]" else ".#{name}"
+    @proto + if IS_STRING.test(name) or SIMPLENUM.test(name) then "[#{name}]" else ".#{name}"
 
   isComplex: NO
 
@@ -1491,6 +1491,24 @@ exports.For = class For extends Base
 
   pluckDirectCall: (o, body, name, index) ->
     defs = ''
+    mentionsArgs = Expressions.wrap(body.expressions).contains (node) ->
+      node instanceof Literal and node.value is 'arguments'
+    mentionsContinue = yes
+    mentionsBreak = yes
+    mentionsReturn = yes
+    hasPure = mentionsContinue or mentionsBreak or mentionsReturn
+    postChecks = []
+    if hasPure
+      rvar = new Literal o.scope.freeVariable 'result'
+      postChecks.push new If (new Op '!', rvar), new Literal 'continue'
+      if mentionsReturn
+        condition = new Op '===', new Value(rvar, [new Access new Literal 0]), new Literal utility 'return'
+        postChecks.push new If condition, new Return new Value rvar, [new Access new Literal 1]
+        # TODO: replace returns with `return [__return,<value>]
+      if mentionsBreak
+        condition = new Op '===', new Value(rvar, [new Access new Literal 0]), new Literal utility 'break'
+        postChecks.push new If condition, new Literal 'break'
+        # TODO: replace breaks with `return [__break]
     for expr, idx in body.expressions
       expr = expr.unwrapAll()
       continue unless expr instanceof Call
@@ -1507,10 +1525,17 @@ exports.For = class For extends Base
       args.reverse() if @object
       for arg, i in args
         fn.params.push new Param args[i] = new Literal arg
+      if mentionsArgs
+        fn.params.unshift new Param new Literal o.scope.freeVariable 'args'
+        args.unshift new Literal 'arguments'
+		# TODO: replace `arguments` with `_args`
       if val.base
         [val.base, base] = [base, val]
         args.unshift new Literal 'this'
-      body.expressions[idx] = new Call base, args
+      call = new Call base, args
+      if hasPure
+        call = new Assign rvar, call
+      body.expressions[idx..idx] = [call].concat postChecks
       defs += @tab + new Assign(ref, fn).compile(o, LEVEL_TOP) + ';\n'
     defs
 
@@ -1702,6 +1727,10 @@ UTILITIES =
   # Shortcuts to speed up the lookup time for native functions.
   hasProp: 'Object.prototype.hasOwnProperty'
   slice  : 'Array.prototype.slice'
+
+  # References for wrapping/unwrapping return types of auto-closure-wrapped loops
+  return : '{}'
+  break  : '{}'
 
 # Levels indicates a node's position in the AST. Useful for knowing if
 # parens are necessary or superfluous.
