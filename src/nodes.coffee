@@ -1491,44 +1491,59 @@ exports.For = class For extends Base
 
   pluckDirectCall: (o, body, name, index) ->
     defs = ''
-    mentionsArgs = Expressions.wrap(body.expressions).contains (node) ->
-      node instanceof Literal and node.value is 'arguments'
-    mentionsContinue = yes
-    mentionsBreak = yes
-    mentionsReturn = yes
-    hasPure = mentionsContinue or mentionsBreak or mentionsReturn
+    mentions  = (expressions, fn) -> Expressions.wrap(expressions).contains fn
+    isLiteral = (name) -> (node) -> node instanceof Literal and (!name? or node.value is name)
+    mentionsArgs     = mentions body.expressions, isLiteral 'arguments'
+    mentionsContinue = mentions body.expressions, isLiteral 'continue'
+    mentionsBreak    = mentions body.expressions, isLiteral 'break'
+    mentionsReturn   = mentions body.expressions, (node) -> node instanceof Return
+    hasPure   = mentionsBreak or mentionsReturn
+    replace   = (fnCondition, fnReplace) ->
+      Expressions.wrap(body.expressions).traverseChildren false, (node) ->
+        fnReplace node if fnCondition node
+        # TODO: make the body of this condition actually do a replacement of the node
+        # with whatever is returned from fnReplace (or remove it if null)
     postChecks = []
+    if mentionsContinue
+      replace ((node) -> node instanceof Literal and node.value is 'continue'),
+              -> new Return
     if hasPure
       rvar = new Literal o.scope.freeVariable 'result'
       postChecks.push new If (new Op '!', rvar), new Literal 'continue'
       if mentionsReturn
-        condition = new Op '===', new Value(rvar, [new Access new Literal 0]), new Literal utility 'return'
+        condition = new Op '===', new Value(rvar, [new Index new Literal 0]), new Literal utility 'return'
         postChecks.push new If condition, new Return new Value rvar, [new Access new Literal 1]
-        # TODO: replace returns with `return [__return,<value>]
+        replace ((node) -> node instanceof Return),
+                 (node) -> new Return new Arr [(new Literal utility 'return'), node.expression]
       if mentionsBreak
-        condition = new Op '===', new Value(rvar, [new Access new Literal 0]), new Literal utility 'break'
+        condition = new Op '===', new Value(rvar, [new Index new Literal 0]), new Literal utility 'break'
         postChecks.push new If condition, new Literal 'break'
-        # TODO: replace breaks with `return [__break]
+        replace ((node) -> node instanceof Literal and node.value is 'break'),
+                -> new Return new Arr [new Literal utility 'break']
     for expr, idx in body.expressions
       expr = expr.unwrapAll()
       continue unless expr instanceof Call
-      val = expr.variable.unwrapAll()
+      val  = expr.variable.unwrapAll()
       continue unless (val instanceof Code) or
                       (val instanceof Value and
                       val.base?.unwrapAll() instanceof Code and
                       val.properties.length is 1 and
                       val.properties[0].name?.value in ['call', 'apply'])
-      fn    = val.base?.unwrapAll() or val
-      ref   = new Literal o.scope.freeVariable 'fn'
-      base  = new Value ref
-      args  = compact [name, index]
+      fn   = val.base?.unwrapAll() or val
+      ref  = new Literal o.scope.freeVariable 'fn'
+      base = new Value ref
+      args = compact [name, index]
       args.reverse() if @object
       for arg, i in args
         fn.params.push new Param args[i] = new Literal arg
       if mentionsArgs
-        fn.params.unshift new Param new Literal o.scope.freeVariable 'args'
+        argsRef = new Literal o.scope.freeVariable 'args'
+        fn.params.unshift new Param argsRef
         args.unshift new Literal 'arguments'
-		# TODO: replace `arguments` with `_args`
+		# this may have a problem with the case that matyr_ mentioned about false-positives
+		# when detecting arguments on #coffeescript: `b.arguments`
+        replace ((node) -> node instanceof Literal and node.value is 'arguments'),
+                 (node) -> new Return new Arr [argsRef]
       if val.base
         [val.base, base] = [base, val]
         args.unshift new Literal 'this'
