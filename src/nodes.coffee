@@ -39,6 +39,7 @@ exports.Base = class Base
     o        = extend {}, o
     o.level  = lvl if lvl
     node     = @unfoldSoak(o) or this
+    node     = node.replacement if node.replacement
     node.tab = o.indent
     if o.level is LEVEL_TOP or node.isPureStatement() or not node.isStatement(o)
       node.compileNode o
@@ -557,6 +558,7 @@ exports.Extends = class Extends extends Base
 # an access into the object's prototype.
 exports.Access = class Access extends Base
   constructor: (@name, tag) ->
+    @name.accessed = yes
     @proto = if tag is 'proto' then '.prototype' else ''
     @soak  = tag is 'soak'
 
@@ -1477,7 +1479,7 @@ exports.For = class For extends Base
     if @guard
       body          = Expressions.wrap [new If @guard, body]
     if hasCode
-      body          = Closure.wrap(body, yes, not @returns)
+      body          = Closure.wrap(body, yes, not @returns, yes)
     varPart         = "\n#{idt1}#{namePart};" if namePart
     if @object
       forPart       = "#{ivar} in #{svar}"
@@ -1491,22 +1493,23 @@ exports.For = class For extends Base
 
   pluckDirectCall: (o, body, name, index) ->
     defs = ''
-    mentions  = (expressions, fn) -> Expressions.wrap(expressions).contains fn
-    isLiteral = (name) -> (node) -> node instanceof Literal and (!name? or node.value is name)
-    mentionsArgs     = mentions body.expressions, isLiteral 'arguments'
-    mentionsContinue = mentions body.expressions, isLiteral 'continue'
-    mentionsBreak    = mentions body.expressions, isLiteral 'break'
-    mentionsReturn   = mentions body.expressions, (node) -> node instanceof Return
+    expressions = body.expressions[0].variable.base.body.expressions
+    mentions    = (expressions, fn) -> Expressions.wrap(expressions).contains fn
+    isLiteral   = (name) -> (node) ->
+      node instanceof Literal and (node.value is name or !name) and not node.accessed
+    mentionsArgs     = mentions expressions, isLiteral 'arguments'
+    mentionsContinue = mentions expressions, isLiteral 'continue'
+    mentionsBreak    = mentions expressions, isLiteral 'break'
+    mentionsReturn   = mentions expressions, (node) -> node instanceof Return
     hasPure   = mentionsBreak or mentionsReturn
     replace   = (fnCondition, fnReplace) ->
-      Expressions.wrap(body.expressions).traverseChildren false, (node) ->
-        fnReplace node if fnCondition node
-        # TODO: make the body of this condition actually do a replacement of the node
-        # with whatever is returned from fnReplace (or remove it if null)
+      Expressions.wrap(expressions).traverseChildren false, (node) ->
+        node.replacement = fnReplace node if fnCondition node
+        node not instanceof For
     postChecks = []
     if mentionsContinue
       replace ((node) -> node instanceof Literal and node.value is 'continue'),
-              -> new Return
+              -> new Literal 'return'
     if hasPure
       rvar = new Literal o.scope.freeVariable 'result'
       postChecks.push new If (new Op '!', rvar), new Literal 'continue'
@@ -1521,9 +1524,7 @@ exports.For = class For extends Base
         replace ((node) -> node instanceof Literal and node.value is 'break'),
                 -> new Return new Arr [new Literal utility 'break']
     for expr, idx in body.expressions
-      expr = expr.unwrapAll()
-      continue unless expr instanceof Call
-      val  = expr.variable.unwrapAll()
+      val  = expr.unwrapAll()?.variable.unwrapAll()
       continue unless (val instanceof Code) or
                       (val instanceof Value and
                       val.base?.unwrapAll() instanceof Code and
@@ -1540,14 +1541,12 @@ exports.For = class For extends Base
         argsRef = new Literal o.scope.freeVariable 'args'
         fn.params.unshift new Param argsRef
         args.unshift new Literal 'arguments'
-		# this may have a problem with the case that matyr_ mentioned about false-positives
-		# when detecting arguments on #coffeescript: `b.arguments`
         replace ((node) -> node instanceof Literal and node.value is 'arguments'),
                  (node) -> new Return new Arr [argsRef]
       if val.base
         [val.base, base] = [base, val]
-        args.unshift new Literal 'this'
-      call = new Call base, args
+      args.unshift new Literal 'this'
+      call = new Call new Value(ref, [new Access new Literal 'call']), args
       if hasPure
         call = new Assign rvar, call
       body.expressions[idx..idx] = [call].concat postChecks
@@ -1681,8 +1680,8 @@ Closure =
   # Wrap the expressions body, unless it contains a pure statement,
   # in which case, no dice. If the body mentions `this` or `arguments`,
   # then make sure that the closure wrapper preserves the original values.
-  wrap: (expressions, statement, noReturn) ->
-    return expressions if expressions.containsPureStatement()
+  wrap: (expressions, statement, noReturn, force) ->
+    return expressions if expressions.containsPureStatement() and not force
     func = new Code [], Expressions.wrap [expressions]
     args = []
     if (mentionsArgs = expressions.contains @literalArgs) or
